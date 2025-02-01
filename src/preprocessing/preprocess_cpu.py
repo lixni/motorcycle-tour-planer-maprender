@@ -16,8 +16,6 @@ from tqdm import tqdm
 import gc
 import mmap
 import tempfile
-import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor
 
 # Define constants
 RAW_MAPS_DIR = Path(__file__).parent.parent.parent / 'data' / 'maps' / 'raw'
@@ -38,10 +36,10 @@ class CPUPreprocessHandler(osmium.SimpleHandler):
         self.nodes = {}  # Keep this for direct access
         self.referenced_nodes = set()
         self.region = region_name
-        # Optimize batch sizes for M2's cache
-        self.batch_size = 16000  # Increased for M2's larger cache
-        self.node_batch_size = 800000  # Doubled for unified memory
-        self.max_ways_in_memory = 8000  # Increased for better throughput
+        # Even smaller batch sizes
+        self.batch_size = 1000
+        self.node_batch_size = 100000
+        self.max_ways_in_memory = 100
         self.processed_nodes = 0
         self.processed_ways = 0
         self.current_batch = []
@@ -121,6 +119,7 @@ class CPUPreprocessHandler(osmium.SimpleHandler):
     def _process_batch(self):
         """Process and store the current batch of ways"""
         if self.current_batch:
+            processed_count = 0
             for way_id, nodes, tags in self.current_batch:
                 if len(nodes) >= 2:  # Double check we have enough nodes
                     self.ways[way_id] = {
@@ -129,6 +128,15 @@ class CPUPreprocessHandler(osmium.SimpleHandler):
                         'name': tags.get('name', str(way_id)),
                         'surface': tags.get('surface', 'unknown')
                     }
+                    processed_count += 1
+            
+            if processed_count == 0:
+                print("\nWarning: No ways processed in batch")
+                print(f"Batch size: {len(self.current_batch)}")
+                if self.current_batch:
+                    sample_way = self.current_batch[0]
+                    print(f"Sample way: id={sample_way[0]}, nodes={len(sample_way[1])}")
+            
             self.current_batch = []
             gc.collect()
 
@@ -187,88 +195,82 @@ def calculate_curviness_cpu(points_x, points_y):
     return results
 
 def process_batch_cpu(batch):
-    """Process a single batch of ways on CPU - optimized for M2"""
+    """Process a single batch of ways on CPU"""
     batch_results = {}
     
     try:
+        # Prepare batch data
         points_arrays = [points for _, points in batch]
         total_points = sum(len(points) for points in points_arrays)
         
+        # Skip if batch is too small
         if total_points < 3:
             return batch_results
         
-        # Use float32 instead of float64 for better M2 performance
-        points_x = np.zeros(total_points, dtype=np.float32)
-        points_y = np.zeros(total_points, dtype=np.float32)
+        # Allocate arrays
+        points_x = np.zeros(total_points)
+        points_y = np.zeros(total_points)
         
+        # Fill arrays
         current_idx = 0
         batch_indices = []
         for points in points_arrays:
-            points_x[current_idx:current_idx + len(points)] = points[:, 0].astype(np.float32)
-            points_y[current_idx:current_idx + len(points)] = points[:, 1].astype(np.float32)
+            points_x[current_idx:current_idx + len(points)] = points[:, 0]
+            points_y[current_idx:current_idx + len(points)] = points[:, 1]
             batch_indices.append((current_idx, current_idx + len(points)))
             current_idx += len(points)
         
+        # Calculate curviness
         results = calculate_curviness_cpu(points_x, points_y)
         
+        # Process results for each way in batch
         for (way_id, _), (start_idx, end_idx) in zip(batch, batch_indices):
             if end_idx - start_idx >= 3:
                 way_results = results[start_idx:end_idx-2]
                 batch_results[way_id] = float(np.mean(way_results))
-                
+        
     except Exception as e:
         print(f"Error processing batch: {str(e)}")
     
     return batch_results
 
-def process_ways_parallel(ways_chunk):
-    """Process a chunk of ways in parallel"""
-    return process_batch_cpu(ways_chunk)
-
 def process_ways_cpu(ways):
-    """Process ways with parallel processing for M2"""
-    print("Processing ways on CPU using parallel processing...")
+    """Process ways with memory mapping"""
+    print("Processing ways on CPU...")
     
-    # Optimize batch sizes for M2
-    optimal_batch_size = 2000
-    max_points_per_batch = 10000
-    min_points_per_batch = 200
+    # Very small batch sizes
+    optimal_batch_size = 100
+    max_points_per_batch = 1000
+    min_points_per_batch = 50
     
     processed_ways = {}
     way_items = list(ways.items())
     
-    # Determine optimal number of processes for M2
-    num_processes = mp.cpu_count() - 1  # Leave one core free
-    
-    # Prepare batches for parallel processing
-    batches = []
-    current_batch = []
-    current_points = 0
-    
-    for way_id, way_info in way_items:
-        nodes = way_info['nodes']
-        if len(nodes) >= 3:
-            points = np.array(nodes)
-            if current_points + len(points) > max_points_per_batch:
-                if current_points >= min_points_per_batch:
-                    batches.append(current_batch)
-                    current_batch = []
-                    current_points = 0
-            
-            current_points += len(points)
-            current_batch.append((way_id, points))
-    
-    if current_batch:
-        batches.append(current_batch)
-    
-    # Process batches in parallel
-    print(f"Processing {len(batches)} batches using {num_processes} processes...")
-    with ProcessPoolExecutor(max_workers=num_processes) as executor:
-        results = list(tqdm(executor.map(process_ways_parallel, batches), total=len(batches)))
-    
-    # Combine results
-    for batch_result in results:
-        processed_ways.update(batch_result)
+    for i in tqdm(range(0, len(way_items), optimal_batch_size)):
+        batch = way_items[i:i + optimal_batch_size]
+        current_batch = []
+        current_points = 0
+        
+        for way_id, way_info in batch:
+            nodes = way_info['nodes']
+            if len(nodes) >= 3:
+                points = np.array(nodes)
+                if current_points + len(points) > max_points_per_batch:
+                    if current_points >= min_points_per_batch:
+                        processed_ways.update(process_batch_cpu(current_batch))
+                        current_batch = []
+                        current_points = 0
+                        gc.collect()
+                
+                current_points += len(points)
+                current_batch.append((way_id, points))
+        
+        if current_batch and current_points >= min_points_per_batch:
+            processed_ways.update(process_batch_cpu(current_batch))
+            gc.collect()
+        
+        if i % (optimal_batch_size * 5) == 0:
+            gc.collect()
     
     return processed_ways
 
@@ -311,9 +313,9 @@ def build_road_graph(ways, processed_ways):
                     
                     # Add nodes if they don't exist
                     if start not in G:
-                        G.add_node(start)
+                        G.add_node(start, pos=start)
                     if end not in G:
-                        G.add_node(end)
+                        G.add_node(end, pos=end)
                     
                     # Calculate distance
                     try:
@@ -328,13 +330,14 @@ def build_road_graph(ways, processed_ways):
                     # Get curvature (with default of 0 if not found)
                     curvature = processed_ways.get(way_id, 0)
                     
-                    # Add edge
+                    # Add edge with all attributes
                     G.add_edge(
                         start, end,
                         distance=distance,
                         type=road_type,
                         curviness=curvature,
-                        elevation_change=0
+                        elevation_change=0,
+                        way_id=way_id
                     )
                     edges_added += 1
                 
@@ -353,8 +356,6 @@ def build_road_graph(ways, processed_ways):
         
         except Exception as e:
             errors['way_processing'] += 1
-            if errors['way_processing'] < 10:  # Only print first 10 detailed errors
-                print(f"\nError processing way {way_id}: {str(e)}")
             continue
     
     print(f"\nFinal graph has {len(G.nodes):,} nodes and {len(G.edges):,} edges")
@@ -362,6 +363,13 @@ def build_road_graph(ways, processed_ways):
         print("\nFinal error summary:")
         for error_type, count in errors.items():
             print(f"- {error_type}: {count:,}")
+    
+    if len(G.nodes) == 0:
+        print("\nDebug information:")
+        print(f"Total ways processed: {total_ways}")
+        print(f"Total edges added: {edges_added}")
+        print(f"Error counts: {dict(errors)}")
+        print(f"Sample way data: {next(iter(ways.items())) if ways else 'No ways'}")
     
     return G
 
